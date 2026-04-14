@@ -306,7 +306,7 @@ select:focus,input:focus{border-color:var(--accent);}
     <div class="upload-zone" id="uploadZone" onclick="document.getElementById('fileInput').click()" ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDrop(event)">
       <input type="file" id="fileInput" multiple onchange="handleFileSelect(event)"/>
       <div class="upload-zone-text">Klikni alebo presuň súbory sem</div>
-      <div class="upload-zone-sub">PDF, Excel, Word, obrázky — max 50 MB/súbor</div>
+      <div class="upload-zone-sub">PDF, Excel, Word, obrázky — max 5 MB/súbor</div>
     </div>
     <div class="file-list" id="fileList"></div>
   </div>
@@ -469,12 +469,12 @@ async function push(action, payload) {
   if (!cfg.scriptUrl) return;
   setSyncStatus('syncing','Ukladám...');
   try {
-    // Serializuj payload ako JSON string — GAS ho dostane v parametri 'data'
     const params = { action, data: encodeURIComponent(JSON.stringify(payload)) };
     const result = await gasGet(params);
     if (result.status === 'ok') {
-      // Po uspesnom ulozeni refreshni cely stav zo Sheets
-      await loadFromBackend();
+      setSyncStatus('synced','Uložené '+new Date().toLocaleTimeString('sk-SK',{hour:'2-digit',minute:'2-digit'}));
+      // Refresh zo Sheets asynchrónne na pozadí — neblokuje UI
+      loadFromBackend().catch(()=>{});
     } else {
       setSyncStatus('error', 'Chyba: ' + (result.message || 'neznáma'));
       toast('Chyba uloženia: ' + (result.message || ''), 'error');
@@ -498,7 +498,7 @@ function handleFileSelect(e) { addPendingFiles([...e.target.files]); e.target.va
 
 function addPendingFiles(files) {
   files.forEach(f => {
-    if (f.size > 52428800) { toast(`Súbor "${f.name}" je väčší ako 50 MB`, 'error'); return; }
+    if (f.size > 5242880) { toast(`Súbor "${f.name}" je väčší ako 5 MB — znížte veľkosť alebo použite Drive link`, 'error'); return; }
     pendingFiles.push({file:f, name:f.name, size:f.size, status:'pending'});
   });
   renderFileList();
@@ -512,7 +512,7 @@ function renderFileList() {
     const div = document.createElement('div'); div.className='file-item';
     div.innerHTML = `<span class="file-item-name">${escHtml(a.name)}</span>
       <span class="file-item-size">${fmtSize(a.size)}</span>
-      <a class="file-item-link" href="${a.url}" target="_blank">Otvoriť</a>
+      <a class="file-item-link" href="#" onclick="openAttachment(${JSON.stringify(a).replace(/'/g, '&apos;')});return false;">Otvoriť</a>
       <button class="file-item-remove" onclick="removeExisting(${i})" title="Odstrániť">×</button>`;
     list.appendChild(div);
   });
@@ -533,52 +533,26 @@ function removeExisting(i) { existingAttachments.splice(i,1); renderFileList(); 
 function removePending(i) { pendingFiles.splice(i,1); renderFileList(); }
 
 async function uploadPendingFiles(taskId) {
-  if (!cfg.scriptUrl || !pendingFiles.length) return;
-  const CHUNK_SIZE = 6000; // znakov base64 per chunk — bezpecne pod URL limit GAS
-
+  if (!pendingFiles.length) return;
+  // Subory sa ukladaju ako base64 priamo do task.attachments v Sheets
+  // Bez uploadu, bez CORS, funguje pre subory do 5MB
   for (let i = 0; i < pendingFiles.length; i++) {
     const pf = pendingFiles[i];
     if (pf.status === 'done') continue;
     pf.status = 'uploading'; renderFileList();
-
     try {
       const base64 = await fileToBase64(pf.file);
-      const uploadId = 'u' + Date.now() + '_' + i;
-      const chunks = [];
-      for (let c = 0; c < base64.length; c += CHUNK_SIZE) {
-        chunks.push(base64.slice(c, c + CHUNK_SIZE));
-      }
-
-      // Nahraj chunky jeden po druhom
-      for (let ci = 0; ci < chunks.length; ci++) {
-        const chunkParams = {
-          action: 'uploadChunk',
-          uploadId,
-          chunkIndex: String(ci),
-          chunkData: chunks[ci],
-          totalChunks: String(chunks.length)
-        };
-        // Pridaj metadata len do prveho chunku
-        if (ci === 0) {
-          chunkParams.fileName = encodeURIComponent(pf.name);
-          chunkParams.mimeType = encodeURIComponent(pf.file.type || 'application/octet-stream');
-          chunkParams.taskId   = String(taskId);
-        }
-        const chunkRes = await gasGet(chunkParams);
-        if (chunkRes.status !== 'ok') throw new Error('Chunk ' + ci + ' failed');
-      }
-
-      // Finalizuj — GAS spojí chunky a nahrá do Drive
-      const finalRes = await gasGet({ action: 'uploadFinalize', uploadId });
-      if (finalRes.status === 'ok' && finalRes.url) {
-        pf.status = 'done';
-        existingAttachments.push({ name: pf.name, url: finalRes.url, size: pf.size });
-        pendingFiles = pendingFiles.filter(p => p !== pf);
-        i--; // korekcia indexu po odstraneni
-      } else {
-        pf.status = 'error';
-        toast('Chyba nahrávania: ' + (finalRes.message || ''), 'error');
-      }
+      // Uloz ako data URL — otvorí sa priamo v prehliadači
+      const dataUrl = 'data:' + (pf.file.type || 'application/octet-stream') + ';base64,' + base64;
+      pf.status = 'done';
+      existingAttachments.push({
+        name: pf.name,
+        url: dataUrl,
+        size: pf.size,
+        type: pf.file.type || 'application/octet-stream'
+      });
+      pendingFiles = pendingFiles.filter(p => p !== pf);
+      i--;
     } catch(e) {
       pf.status = 'error';
       toast('Chyba súboru: ' + e.message, 'error');
@@ -663,7 +637,7 @@ function renderBoard() {
           ${t.date?`<span class="due${od?' overdue':''}">${od?'! ':''}${fmtDate(t.date)}</span>`:''}
         </div>
         ${atts.length?`<div class="card-attachments">
-          ${atts.slice(0,2).map(a=>`<a class="attach-chip" href="${a.url}" target="_blank" onclick="event.stopPropagation()">${escHtml(a.name)}</a>`).join('')}
+          ${atts.slice(0,2).map(a=>`<a class="attach-chip" href="#" onclick="event.stopPropagation();openAttachment(${JSON.stringify(a).replace(/"/g,'&quot;')})">${escHtml(a.name)}</a>`).join('')}
           ${atts.length>2?`<span class="attach-count">+${atts.length-2}</span>`:''}
         </div>`:''}`;
       c.onclick = () => openModal(t.id);
@@ -996,6 +970,24 @@ async function notifySlack(text, fields) {
 // ═══════════════════════════════════════════════
 //  UTILS
 // ═══════════════════════════════════════════════
+function openAttachment(att) {
+  if (!att || !att.url) return;
+  if (att.url.startsWith('data:')) {
+    // Base64 data URL — otvor ako blob v novom okne
+    const parts = att.url.split(',');
+    const mime = parts[0].split(':')[1].split(';')[0];
+    const byteStr = atob(parts[1]);
+    const ab = new ArrayBuffer(byteStr.length);
+    const ia = new Uint8Array(ab);
+    for (let i = 0; i < byteStr.length; i++) ia[i] = byteStr.charCodeAt(i);
+    const blob = new Blob([ab], {type: mime});
+    const blobUrl = URL.createObjectURL(blob);
+    window.open(blobUrl, '_blank');
+  } else {
+    window.open(att.url, '_blank');
+  }
+}
+
 function blendColor(hex, darken) {
   // Returns a slightly darkened hex for border
   try {
