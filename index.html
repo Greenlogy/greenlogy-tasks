@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="sk">
 <head>
@@ -535,31 +534,54 @@ function removePending(i) { pendingFiles.splice(i,1); renderFileList(); }
 
 async function uploadPendingFiles(taskId) {
   if (!cfg.scriptUrl || !pendingFiles.length) return;
+  const CHUNK_SIZE = 6000; // znakov base64 per chunk — bezpecne pod URL limit GAS
+
   for (let i = 0; i < pendingFiles.length; i++) {
     const pf = pendingFiles[i];
     if (pf.status === 'done') continue;
     pf.status = 'uploading'; renderFileList();
+
     try {
       const base64 = await fileToBase64(pf.file);
-      const result = await gasGet({
-        action: 'uploadFile',
-        taskId: String(taskId),
-        fileName: encodeURIComponent(pf.name),
-        mimeType: encodeURIComponent(pf.file.type || 'application/octet-stream'),
-        fileData: base64
-      });
-      if (result.status === 'ok' && result.url) {
+      const uploadId = 'u' + Date.now() + '_' + i;
+      const chunks = [];
+      for (let c = 0; c < base64.length; c += CHUNK_SIZE) {
+        chunks.push(base64.slice(c, c + CHUNK_SIZE));
+      }
+
+      // Nahraj chunky jeden po druhom
+      for (let ci = 0; ci < chunks.length; ci++) {
+        const chunkParams = {
+          action: 'uploadChunk',
+          uploadId,
+          chunkIndex: String(ci),
+          chunkData: chunks[ci],
+          totalChunks: String(chunks.length)
+        };
+        // Pridaj metadata len do prveho chunku
+        if (ci === 0) {
+          chunkParams.fileName = encodeURIComponent(pf.name);
+          chunkParams.mimeType = encodeURIComponent(pf.file.type || 'application/octet-stream');
+          chunkParams.taskId   = String(taskId);
+        }
+        const chunkRes = await gasGet(chunkParams);
+        if (chunkRes.status !== 'ok') throw new Error('Chunk ' + ci + ' failed');
+      }
+
+      // Finalizuj — GAS spojí chunky a nahrá do Drive
+      const finalRes = await gasGet({ action: 'uploadFinalize', uploadId });
+      if (finalRes.status === 'ok' && finalRes.url) {
         pf.status = 'done';
-        existingAttachments.push({name: pf.name, url: result.url, size: pf.size});
-        // Okamzite odstran z pendingFiles aby sa nezobrazoval duplicitne
+        existingAttachments.push({ name: pf.name, url: finalRes.url, size: pf.size });
         pendingFiles = pendingFiles.filter(p => p !== pf);
+        i--; // korekcia indexu po odstraneni
       } else {
         pf.status = 'error';
-        toast('Chyba nahravania suboru', 'error');
+        toast('Chyba nahrávania: ' + (finalRes.message || ''), 'error');
       }
     } catch(e) {
       pf.status = 'error';
-      toast('Chyba: ' + e.message, 'error');
+      toast('Chyba súboru: ' + e.message, 'error');
     }
     renderFileList();
   }
@@ -743,7 +765,7 @@ async function saveTask() {
 
   if (editId) {
     tasks[tasks.findIndex(x=>x.id===editId)] = task;
-    await push('updateTask', {task});
+    await push('updateTask', task);
     if (oldCol !== newCol) {
       await notifySlack(`Úloha presunutá: *${task.title}*`, [
         {t:'Zodpovedný',v:task.owner},{t:'Zmena',v:`${oldCol} → ${newCol}`},{t:'Deadline',v:fmtDate(task.date)||'—'}
@@ -752,7 +774,7 @@ async function saveTask() {
     toast('Úloha aktualizovaná');
   } else {
     tasks.push(task);
-    await push('addTask', {task});
+    await push('addTask', task);
     await notifySlack(`Nová úloha: *${task.title}*`, [
       {t:'Zodpovedný',v:task.owner},{t:'Priorita',v:task.prio},{t:'Stĺpec',v:newCol},{t:'Deadline',v:fmtDate(task.date)||'—'}
     ]);
@@ -768,7 +790,7 @@ async function deleteTask() {
   const t = tasks.find(x=>x.id===editId);
   if (!confirm(`Vymazať úlohu "${t?.title}"?`)) return;
   tasks = tasks.filter(x=>x.id!==editId);
-  await push('deleteTask',{id:editId});
+  await push('deleteTask',{id:editId, _dummy:'x'});
   saveLocal(); closeModal(); renderAll();
   toast('Úloha vymazaná');
 }
