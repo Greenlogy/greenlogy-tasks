@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="sk">
 <head>
@@ -437,16 +438,9 @@ function gasGet(params) {
 }
 
 async function gasPost(payload) {
-  if (!cfg.scriptUrl) return;
-  // no-cors POST — GAS prijme a spracuje, odpoveď je opaque (nečitateľná)
-  try {
-    await fetch(cfg.scriptUrl, {
-      method: 'POST',
-      mode: 'no-cors',
-      headers: {'Content-Type': 'text/plain'},
-      body: JSON.stringify(payload)
-    });
-  } catch(e) {}
+  // Wrapper — presmeruje na gasGet aby sme dostali odpoved naspat
+  // no-cors POST je nespol'ahlivy a nevrati odpoved, preto pouzivame GET/JSONP
+  return gasGet(payload);
 }
 
 async function loadFromBackend() {
@@ -475,20 +469,21 @@ async function loadFromBackend() {
 async function push(action, payload) {
   if (!cfg.scriptUrl) return;
   setSyncStatus('syncing','Ukladám...');
-  await gasPost({action, ...payload});
-  // Po no-cors POST refreshneme zo Sheets — toto je potvrdenie že sa uložilo
-  await new Promise(r => setTimeout(r, 1800));
   try {
-    const data = await gasGet({action:'getAll'});
-    if (data.status === 'ok') {
-      tasks = data.tasks || [];
-      if (data.config && data.config.colColors) cfg.colColors = data.config.colColors;
-      nextId = tasks.length ? Math.max(...tasks.map(t=>t.id||0)) + 1 : 1;
-      saveLocal();
-      renderAll();
-      setSyncStatus('synced','Uložené '+new Date().toLocaleTimeString('sk-SK',{hour:'2-digit',minute:'2-digit'}));
+    // Serializuj payload ako JSON string — GAS ho dostane v parametri 'data'
+    const params = { action, data: encodeURIComponent(JSON.stringify(payload)) };
+    const result = await gasGet(params);
+    if (result.status === 'ok') {
+      // Po uspesnom ulozeni refreshni cely stav zo Sheets
+      await loadFromBackend();
+    } else {
+      setSyncStatus('error', 'Chyba: ' + (result.message || 'neznáma'));
+      toast('Chyba uloženia: ' + (result.message || ''), 'error');
     }
-  } catch(e) { setSyncStatus('synced','Odoslané — obnovte pre potvrdenie'); }
+  } catch(e) {
+    setSyncStatus('error', 'Offline');
+    toast('Chyba spojenia', 'error');
+  }
 }
 
 // ═══════════════════════════════════════════════
@@ -867,7 +862,7 @@ function addUser() {
   document.getElementById('newUserName').value='';
   document.getElementById('newUserEmail').value='';
   saveCfgLocal();
-  push('saveConfig',{config:{members:cfg.members,columns:cfg.columns}});
+  push('saveConfig',{members:cfg.members,columns:cfg.columns,colColors:cfg.colColors});
   renderUserList(); populateFilterSelects();
   document.getElementById('userLog').textContent=`Užívateľ "${name}" pridaný.`;
   toast(`${name} pridaný`,'success');
@@ -879,7 +874,7 @@ function removeUser(i) {
   if (inUse && !confirm(`Užívateľ "${name}" má priradené úlohy. Naozaj odstrániť?`)) return;
   cfg.members.splice(i,1);
   saveCfgLocal();
-  push('saveConfig',{config:{members:cfg.members,columns:cfg.columns}});
+  push('saveConfig',{members:cfg.members,columns:cfg.columns,colColors:cfg.colColors});
   renderUserList(); populateFilterSelects();
   document.getElementById('userLog').textContent=`Užívateľ "${name}" odstránený.`;
 }
@@ -951,8 +946,9 @@ function saveColumnsCfg() {
       cfg.colColors[i] = cpick.value;
     }
   });
-  saveCfgLocal(); saveLocal();
-  push('saveConfig',{config:{members:cfg.members,columns:cfg.columns,colColors:cfg.colColors}});
+  saveCfgLocal();
+  // Posli cely config vrátane colColors
+  push('saveConfig', {members:cfg.members, columns:cfg.columns, colColors:cfg.colColors});
   renderAll(); renderColOrderList();
   document.getElementById('colLog').textContent='Stĺpce a farby uložené.';
   toast('Stĺpce uložené','success');
