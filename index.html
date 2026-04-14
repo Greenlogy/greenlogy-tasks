@@ -524,12 +524,12 @@ function renderFileList() {
   });
 
   pendingFiles.forEach((pf, i) => {
+    if (pf.status === 'done') return; // uz je v existingAttachments, nezobrazuj znova
     const div = document.createElement('div'); div.className='file-item';
     div.innerHTML = `<span class="file-item-name">${escHtml(pf.name)}</span>
       <span class="file-item-size">${fmtSize(pf.size)}</span>
       ${pf.status==='uploading'?'<span class="uploading-badge">Nahrávam...</span>':''}
-      ${pf.status==='done'?'<span style="font-size:11px;color:var(--accent)">Nahraté</span>':''}
-      ${pf.status==='error'?'<span style="font-size:11px;color:var(--red)">Chyba</span>':''}
+      ${pf.status==='error'?'<span style="font-size:11px;color:var(--red)">Chyba nahrávania</span>':''}
       <button class="file-item-remove" onclick="removePending(${i})" title="Odstrániť">×</button>`;
     list.appendChild(div);
   });
@@ -546,21 +546,26 @@ async function uploadPendingFiles(taskId) {
     pf.status = 'uploading'; renderFileList();
     try {
       const base64 = await fileToBase64(pf.file);
-      // Upload cez no-cors POST, potom GET na získanie URL
-      await fetch(cfg.scriptUrl, {
-        method:'POST', mode:'no-cors',
-        headers:{'Content-Type':'text/plain'},
-        body: JSON.stringify({
-          action:'uploadFile', taskId,
-          fileName: pf.name, fileData: base64, mimeType: pf.file.type
-        })
+      const result = await gasGet({
+        action: 'uploadFile',
+        taskId: String(taskId),
+        fileName: encodeURIComponent(pf.name),
+        mimeType: encodeURIComponent(pf.file.type || 'application/octet-stream'),
+        fileData: base64
       });
-      // Počkáme chvíľu a načítame aktuálny stav úlohy pre URL prílohy
-      await new Promise(r => setTimeout(r, 2000));
-      // Optimisticky pridáme prílohu — URL sa potvrdí pri ďalšom getAll
-      pf.status = 'done';
-      existingAttachments.push({name:pf.name, url:'#pending', size:pf.size});
-    } catch(e) { pf.status = 'error'; }
+      if (result.status === 'ok' && result.url) {
+        pf.status = 'done';
+        existingAttachments.push({name: pf.name, url: result.url, size: pf.size});
+        // Okamzite odstran z pendingFiles aby sa nezobrazoval duplicitne
+        pendingFiles = pendingFiles.filter(p => p !== pf);
+      } else {
+        pf.status = 'error';
+        toast('Chyba nahravania suboru', 'error');
+      }
+    } catch(e) {
+      pf.status = 'error';
+      toast('Chyba: ' + e.message, 'error');
+    }
     renderFileList();
   }
   pendingFiles = pendingFiles.filter(pf => pf.status !== 'done');
@@ -957,11 +962,15 @@ function saveColumnsCfg() {
 //  SLACK
 // ═══════════════════════════════════════════════
 async function notifySlack(text, fields) {
-  if (!cfg.webhook) return;
+  if (!cfg.webhook || !cfg.scriptUrl) return;
+  // Priamy fetch na hooks.slack.com je blokowany CORS z GitHub Pages.
+  // Notifikaciu posielame cez GAS backend ktory zavola Slack zo servera.
   try {
-    await fetch(cfg.webhook, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({text, attachments:[{color:'#1A6B4A', fields:fields.map(f=>({title:f.t,value:f.v,short:true}))}]})
+    await gasGet({
+      action: 'slackNotify',
+      webhook: encodeURIComponent(cfg.webhook),
+      text: encodeURIComponent(text),
+      fields: encodeURIComponent(JSON.stringify(fields))
     });
   } catch(e) {}
 }
